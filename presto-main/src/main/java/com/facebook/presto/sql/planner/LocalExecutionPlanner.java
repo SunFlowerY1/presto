@@ -16,7 +16,7 @@ package com.facebook.presto.sql.planner;
 import com.facebook.presto.Session;
 import com.facebook.presto.SystemSessionProperties;
 import com.facebook.presto.execution.ExplainAnalyzeContext;
-import com.facebook.presto.execution.StageId;
+import com.facebook.presto.execution.StageExecutionId;
 import com.facebook.presto.execution.TaskManagerConfig;
 import com.facebook.presto.execution.buffer.OutputBuffer;
 import com.facebook.presto.execution.buffer.PagesSerdeFactory;
@@ -56,7 +56,6 @@ import com.facebook.presto.operator.PagesIndex;
 import com.facebook.presto.operator.PagesSpatialIndexFactory;
 import com.facebook.presto.operator.PartitionFunction;
 import com.facebook.presto.operator.PartitionedLookupSourceFactory;
-import com.facebook.presto.operator.PartitionedOutputOperator.PartitionedOutputFactory;
 import com.facebook.presto.operator.PipelineExecutionStrategy;
 import com.facebook.presto.operator.RowNumberOperator;
 import com.facebook.presto.operator.ScanFilterAndProjectOperator.ScanFilterAndProjectOperatorFactory;
@@ -97,6 +96,8 @@ import com.facebook.presto.operator.index.IndexLookupSourceFactory;
 import com.facebook.presto.operator.index.IndexSourceOperator;
 import com.facebook.presto.operator.project.CursorProcessor;
 import com.facebook.presto.operator.project.PageProcessor;
+import com.facebook.presto.operator.repartition.OptimizedPartitionedOutputOperator.OptimizedPartitionedOutputFactory;
+import com.facebook.presto.operator.repartition.PartitionedOutputOperator.PartitionedOutputFactory;
 import com.facebook.presto.operator.window.FrameInfo;
 import com.facebook.presto.operator.window.WindowFunctionSupplier;
 import com.facebook.presto.spi.ColumnHandle;
@@ -112,11 +113,16 @@ import com.facebook.presto.spi.block.SortOrder;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.function.FunctionMetadata;
 import com.facebook.presto.spi.function.OperatorType;
+import com.facebook.presto.spi.plan.AggregationNode;
+import com.facebook.presto.spi.plan.AggregationNode.Aggregation;
+import com.facebook.presto.spi.plan.AggregationNode.Step;
+import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.FilterNode;
 import com.facebook.presto.spi.plan.LimitNode;
 import com.facebook.presto.spi.plan.OrderingScheme;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
+import com.facebook.presto.spi.plan.ProjectNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TopNNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -142,11 +148,7 @@ import com.facebook.presto.sql.gen.OrderingCompiler;
 import com.facebook.presto.sql.gen.PageFunctionCompiler;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.optimizations.IndexJoinOptimizer;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
-import com.facebook.presto.sql.planner.plan.AggregationNode.Aggregation;
-import com.facebook.presto.sql.planner.plan.AggregationNode.Step;
 import com.facebook.presto.sql.planner.plan.AssignUniqueId;
-import com.facebook.presto.sql.planner.plan.Assignments;
 import com.facebook.presto.sql.planner.plan.DeleteNode;
 import com.facebook.presto.sql.planner.plan.DistinctLimitNode;
 import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
@@ -160,7 +162,6 @@ import com.facebook.presto.sql.planner.plan.JoinNode;
 import com.facebook.presto.sql.planner.plan.MarkDistinctNode;
 import com.facebook.presto.sql.planner.plan.MetadataDeleteNode;
 import com.facebook.presto.sql.planner.plan.OutputNode;
-import com.facebook.presto.sql.planner.plan.ProjectNode;
 import com.facebook.presto.sql.planner.plan.RemoteSourceNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SampleNode;
@@ -218,10 +219,12 @@ import java.util.stream.IntStream;
 import static com.facebook.presto.SystemSessionProperties.getAggregationOperatorUnspillMemoryLimit;
 import static com.facebook.presto.SystemSessionProperties.getFilterAndProjectMinOutputPageRowCount;
 import static com.facebook.presto.SystemSessionProperties.getFilterAndProjectMinOutputPageSize;
+import static com.facebook.presto.SystemSessionProperties.getIndexLoaderTimeout;
 import static com.facebook.presto.SystemSessionProperties.getTaskConcurrency;
+import static com.facebook.presto.SystemSessionProperties.getTaskPartitionedWriterCount;
 import static com.facebook.presto.SystemSessionProperties.getTaskWriterCount;
-import static com.facebook.presto.SystemSessionProperties.isConcurrentWritesToPartitionedTableEnabled;
 import static com.facebook.presto.SystemSessionProperties.isExchangeCompressionEnabled;
+import static com.facebook.presto.SystemSessionProperties.isOptimizedRepartitioningEnabled;
 import static com.facebook.presto.SystemSessionProperties.isSpillEnabled;
 import static com.facebook.presto.operator.DistinctLimitOperator.DistinctLimitOperatorFactory;
 import static com.facebook.presto.operator.NestedLoopBuildOperator.NestedLoopBuildOperatorFactory;
@@ -238,6 +241,9 @@ import static com.facebook.presto.operator.TableWriterUtils.STATS_START_CHANNEL;
 import static com.facebook.presto.operator.WindowFunctionDefinition.window;
 import static com.facebook.presto.operator.unnest.UnnestOperator.UnnestOperatorFactory;
 import static com.facebook.presto.spi.StandardErrorCode.COMPILER_ERROR;
+import static com.facebook.presto.spi.plan.AggregationNode.Step.FINAL;
+import static com.facebook.presto.spi.plan.AggregationNode.Step.INTERMEDIATE;
+import static com.facebook.presto.spi.plan.AggregationNode.Step.PARTIAL;
 import static com.facebook.presto.spi.relation.ExpressionOptimizer.Level.OPTIMIZED;
 import static com.facebook.presto.spi.relation.LogicalRowExpressions.TRUE_CONSTANT;
 import static com.facebook.presto.spi.relation.RowExpressionNodeInliner.replaceExpression;
@@ -250,9 +256,6 @@ import static com.facebook.presto.sql.planner.SystemPartitioningHandle.FIXED_ARB
 import static com.facebook.presto.sql.planner.SystemPartitioningHandle.FIXED_BROADCAST_DISTRIBUTION;
 import static com.facebook.presto.sql.planner.SystemPartitioningHandle.SCALED_WRITER_DISTRIBUTION;
 import static com.facebook.presto.sql.planner.SystemPartitioningHandle.SINGLE_DISTRIBUTION;
-import static com.facebook.presto.sql.planner.plan.AggregationNode.Step.FINAL;
-import static com.facebook.presto.sql.planner.plan.AggregationNode.Step.INTERMEDIATE;
-import static com.facebook.presto.sql.planner.plan.AggregationNode.Step.PARTIAL;
 import static com.facebook.presto.sql.planner.plan.AssignmentUtils.identityAssignments;
 import static com.facebook.presto.sql.planner.plan.JoinNode.Type.FULL;
 import static com.facebook.presto.sql.planner.plan.JoinNode.Type.INNER;
@@ -263,8 +266,12 @@ import static com.facebook.presto.sql.planner.plan.TableWriterNode.WriterTarget;
 import static com.facebook.presto.sql.relational.Expressions.constant;
 import static com.facebook.presto.util.Reflection.constructorMethodHandle;
 import static com.facebook.presto.util.SpatialJoinUtils.ST_CONTAINS;
+import static com.facebook.presto.util.SpatialJoinUtils.ST_CROSSES;
 import static com.facebook.presto.util.SpatialJoinUtils.ST_DISTANCE;
+import static com.facebook.presto.util.SpatialJoinUtils.ST_EQUALS;
 import static com.facebook.presto.util.SpatialJoinUtils.ST_INTERSECTS;
+import static com.facebook.presto.util.SpatialJoinUtils.ST_OVERLAPS;
+import static com.facebook.presto.util.SpatialJoinUtils.ST_TOUCHES;
 import static com.facebook.presto.util.SpatialJoinUtils.ST_WITHIN;
 import static com.facebook.presto.util.SpatialJoinUtils.extractSupportedSpatialComparisons;
 import static com.facebook.presto.util.SpatialJoinUtils.extractSupportedSpatialFunctions;
@@ -433,6 +440,28 @@ public class LocalExecutionPlanner
             nullChannel = OptionalInt.of(outputLayout.indexOf(getOnlyElement(partitioningColumns)));
         }
 
+        OutputFactory outputFactory;
+        if (isOptimizedRepartitioningEnabled(taskContext.getSession())) {
+            outputFactory = new OptimizedPartitionedOutputFactory(
+                    partitionFunction,
+                    partitionChannels,
+                    partitionConstants,
+                    partitioningScheme.isReplicateNullsAndAny(),
+                    nullChannel,
+                    outputBuffer,
+                    maxPagePartitioningBufferSize);
+        }
+        else {
+            outputFactory = new PartitionedOutputFactory(
+                    partitionFunction,
+                    partitionChannels,
+                    partitionConstants,
+                    partitioningScheme.isReplicateNullsAndAny(),
+                    nullChannel,
+                    outputBuffer,
+                    maxPagePartitioningBufferSize);
+        }
+
         return plan(
                 taskContext,
                 stageExecutionDescriptor,
@@ -440,14 +469,7 @@ public class LocalExecutionPlanner
                 outputLayout,
                 types,
                 partitionedSourceOrder,
-                new PartitionedOutputFactory(
-                        partitionFunction,
-                        partitionChannels,
-                        partitionConstants,
-                        partitioningScheme.isReplicateNullsAndAny(),
-                        nullChannel,
-                        outputBuffer,
-                        maxPagePartitioningBufferSize),
+                outputFactory,
                 taskExchangeClientManager);
     }
 
@@ -590,9 +612,9 @@ public class LocalExecutionPlanner
             return taskContext.getSession();
         }
 
-        public StageId getStageId()
+        public StageExecutionId getStageExecutionId()
         {
-            return taskContext.getTaskId().getStageId();
+            return taskContext.getTaskId().getStageExecutionId();
         }
 
         public TypeProvider getTypes()
@@ -1224,7 +1246,7 @@ public class LocalExecutionPlanner
             try {
                 if (columns != null) {
                     Supplier<CursorProcessor> cursorProcessor = expressionCompiler.compileCursorProcessor(filterExpression, projections, sourceNode.getId());
-                    Supplier<PageProcessor> pageProcessor = expressionCompiler.compilePageProcessor(filterExpression, projections, Optional.of(context.getStageId() + "_" + planNodeId));
+                    Supplier<PageProcessor> pageProcessor = expressionCompiler.compilePageProcessor(filterExpression, projections, Optional.of(context.getStageExecutionId() + "_" + planNodeId));
 
                     SourceOperatorFactory operatorFactory = new ScanFilterAndProjectOperatorFactory(
                             context.getNextOperatorId(),
@@ -1242,7 +1264,7 @@ public class LocalExecutionPlanner
                     return new PhysicalOperation(operatorFactory, outputMappings, context, stageExecutionDescriptor.isScanGroupedExecution(sourceNode.getId()) ? GROUPED_EXECUTION : UNGROUPED_EXECUTION);
                 }
                 else {
-                    Supplier<PageProcessor> pageProcessor = expressionCompiler.compilePageProcessor(filterExpression, projections, Optional.of(context.getStageId() + "_" + planNodeId));
+                    Supplier<PageProcessor> pageProcessor = expressionCompiler.compilePageProcessor(filterExpression, projections, Optional.of(context.getStageExecutionId() + "_" + planNodeId));
 
                     OperatorFactory operatorFactory = new FilterAndProjectOperator.FilterAndProjectOperatorFactory(
                             context.getNextOperatorId(),
@@ -1539,7 +1561,8 @@ public class LocalExecutionPlanner
                     indexJoinLookupStats,
                     SystemSessionProperties.isShareIndexLoading(session),
                     pagesIndexFactory,
-                    joinCompiler);
+                    joinCompiler,
+                    getIndexLoaderTimeout(session));
 
             verify(probeSource.getPipelineExecutionStrategy() == UNGROUPED_EXECUTION);
             verify(indexSource.getPipelineExecutionStrategy() == UNGROUPED_EXECUTION);
@@ -1712,8 +1735,20 @@ public class LocalExecutionPlanner
                     return (buildGeometry, probeGeometry, radius) -> buildGeometry.within(probeGeometry);
                 }
             }
+            if (functionName.equals(ST_CROSSES)) {
+                return (buildGeometry, probeGeometry, radius) -> buildGeometry.crosses(probeGeometry);
+            }
+            if (functionName.equals(ST_EQUALS)) {
+                return (buildGeometry, probeGeometry, radius) -> buildGeometry.Equals(probeGeometry);
+            }
             if (functionName.equals(ST_INTERSECTS)) {
                 return (buildGeometry, probeGeometry, radius) -> buildGeometry.intersects(probeGeometry);
+            }
+            if (functionName.equals(ST_OVERLAPS)) {
+                return (buildGeometry, probeGeometry, radius) -> buildGeometry.overlaps(probeGeometry);
+            }
+            if (functionName.equals(ST_TOUCHES)) {
+                return (buildGeometry, probeGeometry, radius) -> buildGeometry.touches(probeGeometry);
             }
             if (functionName.equals(ST_DISTANCE)) {
                 if (comparisonOperator.get() == OperatorType.LESS_THAN) {
@@ -2148,8 +2183,8 @@ public class LocalExecutionPlanner
         public PhysicalOperation visitTableWriter(TableWriterNode node, LocalExecutionPlanContext context)
         {
             // Set table writer count
-            if (node.getPartitioningScheme().isPresent() && !isConcurrentWritesToPartitionedTableEnabled(session)) {
-                context.setDriverInstanceCount(1);
+            if (node.getPartitioningScheme().isPresent()) {
+                context.setDriverInstanceCount(getTaskPartitionedWriterCount(session));
             }
             else {
                 context.setDriverInstanceCount(getTaskWriterCount(session));
@@ -2850,8 +2885,8 @@ public class LocalExecutionPlanner
     }
 
     /**
-     *  List of sort orders in the same order as the list of variables returned from `getOrderByVariables()`. This means for
-     *  index i, variable `getOrderByVariables().get(i)` has order `getOrderingList().get(i)`.
+     * List of sort orders in the same order as the list of variables returned from `getOrderByVariables()`. This means for
+     * index i, variable `getOrderByVariables().get(i)` has order `getOrderingList().get(i)`.
      */
     private static List<SortOrder> getOrderingList(OrderingScheme orderingScheme)
     {

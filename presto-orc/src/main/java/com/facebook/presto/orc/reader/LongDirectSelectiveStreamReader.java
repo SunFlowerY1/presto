@@ -76,8 +76,10 @@ public class LongDirectSelectiveStreamReader
             LocalMemoryContext systemMemoryContext)
     {
         super(outputType);
+        requireNonNull(filter, "filter is null");
+        checkArgument(filter.isPresent() || outputRequired, "filter must be present if output is not required");
         this.streamDescriptor = requireNonNull(streamDescriptor, "streamDescriptor is null");
-        this.filter = requireNonNull(filter, "filter is null").orElse(null);
+        this.filter = filter.orElse(null);
         this.systemMemoryContext = requireNonNull(systemMemoryContext, "systemMemoryContext is null");
 
         nonDeterministicFilter = this.filter != null && !this.filter.isDeterministic();
@@ -109,16 +111,16 @@ public class LongDirectSelectiveStreamReader
         // account memory used by values, nulls and outputPositions
         systemMemoryContext.setBytes(getRetainedSizeInBytes());
 
-        if (readOffset < offset) {
-            skip(offset - readOffset);
-        }
-
         outputPositionCount = 0;
         int streamPosition = 0;
         if (dataStream == null && presentStream != null) {
             streamPosition = readAllNulls(positions, positionCount);
         }
         else {
+            if (readOffset < offset) {
+                skip(offset - readOffset);
+            }
+
             for (int i = 0; i < positionCount; i++) {
                 int position = positions[i];
                 if (position > streamPosition) {

@@ -97,6 +97,7 @@ public final class HiveQueryRunner
 
         Map<String, String> systemProperties = ImmutableMap.<String, String>builder()
                 .put("task.writer-count", "2")
+                .put("task.partitioned-writer-count", "4")
                 .putAll(extraProperties)
                 .build();
 
@@ -184,6 +185,7 @@ public final class HiveQueryRunner
     private static void setupLogging()
     {
         Logging logging = Logging.initialize();
+        logging.setLevel("com.facebook.presto.event", WARN);
         logging.setLevel("com.facebook.presto.security.AccessControlManager", WARN);
         logging.setLevel("com.facebook.presto.server.PluginManager", WARN);
         logging.setLevel("io.airlift.bootstrap.LifeCycleManager", WARN);

@@ -35,7 +35,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Optional;
-import java.util.Properties;
 
 import static com.facebook.presto.hive.HiveColumnHandle.ColumnType.REGULAR;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_BAD_DATA;
@@ -63,6 +62,7 @@ public class ParquetPageSource
     private final int[] hiveColumnIndexes;
 
     private int batchId;
+    private long completedPositions;
     private boolean closed;
     private final boolean useParquetColumnNames;
 
@@ -71,12 +71,10 @@ public class ParquetPageSource
             MessageType fileSchema,
             MessageColumnIO messageColumnIO,
             TypeManager typeManager,
-            Properties splitSchema,
             List<HiveColumnHandle> columns,
             TupleDomain<HiveColumnHandle> effectivePredicate,
             boolean useParquetColumnNames)
     {
-        requireNonNull(splitSchema, "splitSchema is null");
         requireNonNull(columns, "columns is null");
         requireNonNull(effectivePredicate, "effectivePredicate is null");
         this.parquetReader = requireNonNull(parquetReader, "parquetReader is null");
@@ -122,6 +120,12 @@ public class ParquetPageSource
     }
 
     @Override
+    public long getCompletedPositions()
+    {
+        return completedPositions;
+    }
+
+    @Override
     public long getReadTimeNanos()
     {
         return parquetReader.getDataSource().getReadTimeNanos();
@@ -150,6 +154,8 @@ public class ParquetPageSource
                 close();
                 return null;
             }
+
+            completedPositions += batchSize;
 
             Block[] blocks = new Block[hiveColumnIndexes.length];
             for (int fieldId = 0; fieldId < blocks.length; fieldId++) {

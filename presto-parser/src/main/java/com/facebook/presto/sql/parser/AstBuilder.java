@@ -33,13 +33,13 @@ import com.facebook.presto.sql.tree.CoalesceExpression;
 import com.facebook.presto.sql.tree.ColumnDefinition;
 import com.facebook.presto.sql.tree.Commit;
 import com.facebook.presto.sql.tree.ComparisonExpression;
+import com.facebook.presto.sql.tree.CreateFunction;
 import com.facebook.presto.sql.tree.CreateRole;
 import com.facebook.presto.sql.tree.CreateSchema;
 import com.facebook.presto.sql.tree.CreateTable;
 import com.facebook.presto.sql.tree.CreateTableAsSelect;
 import com.facebook.presto.sql.tree.CreateView;
 import com.facebook.presto.sql.tree.Cube;
-import com.facebook.presto.sql.tree.CurrentPath;
 import com.facebook.presto.sql.tree.CurrentTime;
 import com.facebook.presto.sql.tree.CurrentUser;
 import com.facebook.presto.sql.tree.Deallocate;
@@ -102,8 +102,6 @@ import com.facebook.presto.sql.tree.NullIfExpression;
 import com.facebook.presto.sql.tree.NullLiteral;
 import com.facebook.presto.sql.tree.OrderBy;
 import com.facebook.presto.sql.tree.Parameter;
-import com.facebook.presto.sql.tree.PathElement;
-import com.facebook.presto.sql.tree.PathSpecification;
 import com.facebook.presto.sql.tree.Prepare;
 import com.facebook.presto.sql.tree.PrincipalSpecification;
 import com.facebook.presto.sql.tree.Property;
@@ -121,12 +119,13 @@ import com.facebook.presto.sql.tree.Revoke;
 import com.facebook.presto.sql.tree.RevokeRoles;
 import com.facebook.presto.sql.tree.Rollback;
 import com.facebook.presto.sql.tree.Rollup;
+import com.facebook.presto.sql.tree.RoutineCharacteristics;
+import com.facebook.presto.sql.tree.RoutineCharacteristics.Language;
 import com.facebook.presto.sql.tree.Row;
 import com.facebook.presto.sql.tree.SampledRelation;
 import com.facebook.presto.sql.tree.SearchedCaseExpression;
 import com.facebook.presto.sql.tree.Select;
 import com.facebook.presto.sql.tree.SelectItem;
-import com.facebook.presto.sql.tree.SetPath;
 import com.facebook.presto.sql.tree.SetRole;
 import com.facebook.presto.sql.tree.SetSession;
 import com.facebook.presto.sql.tree.ShowCatalogs;
@@ -144,6 +143,7 @@ import com.facebook.presto.sql.tree.SimpleCaseExpression;
 import com.facebook.presto.sql.tree.SimpleGroupBy;
 import com.facebook.presto.sql.tree.SingleColumn;
 import com.facebook.presto.sql.tree.SortItem;
+import com.facebook.presto.sql.tree.SqlParameterDeclaration;
 import com.facebook.presto.sql.tree.StartTransaction;
 import com.facebook.presto.sql.tree.Statement;
 import com.facebook.presto.sql.tree.StringLiteral;
@@ -179,6 +179,13 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import static com.facebook.presto.sql.tree.RoutineCharacteristics.Determinism;
+import static com.facebook.presto.sql.tree.RoutineCharacteristics.Determinism.DETERMINISTIC;
+import static com.facebook.presto.sql.tree.RoutineCharacteristics.Determinism.NOT_DETERMINISTIC;
+import static com.facebook.presto.sql.tree.RoutineCharacteristics.NullCallClause;
+import static com.facebook.presto.sql.tree.RoutineCharacteristics.NullCallClause.CALLED_ON_NULL_INPUT;
+import static com.facebook.presto.sql.tree.RoutineCharacteristics.NullCallClause.RETURNS_NULL_ON_NULL_INPUT;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static java.lang.String.format;
@@ -206,12 +213,6 @@ class AstBuilder
     public Node visitStandaloneExpression(SqlBaseParser.StandaloneExpressionContext context)
     {
         return visit(context.expression());
-    }
-
-    @Override
-    public Node visitStandalonePathSpecification(SqlBaseParser.StandalonePathSpecificationContext context)
-    {
-        return visit(context.pathSpecification());
     }
 
     // ******************* statements **********************
@@ -398,6 +399,26 @@ class AstBuilder
                 getQualifiedName(context.qualifiedName()),
                 (Query) visit(context.query()),
                 context.REPLACE() != null);
+    }
+
+    @Override
+    public Node visitCreateFunction(SqlBaseParser.CreateFunctionContext context)
+    {
+        return new CreateFunction(
+                getQualifiedName(context.functionName),
+                context.REPLACE() != null,
+                context.sqlParameterDeclaration().stream()
+                        .map(this::getParameterDeclarations)
+                        .collect(toImmutableList()),
+                getType(context.returnType),
+                getRoutineCharacteristics(context.routineCharacteristics()),
+                (Expression) visit(context.routineBody()));
+    }
+
+    @Override
+    public Node visitRoutineBody(SqlBaseParser.RoutineBodyContext context)
+    {
+        return visit(context.expression());
     }
 
     @Override
@@ -955,12 +976,6 @@ class AstBuilder
                 getIdentifierIfPresent(context.identifier()));
     }
 
-    @Override
-    public Node visitSetPath(SqlBaseParser.SetPathContext context)
-    {
-        return new SetPath(getLocation(context), (PathSpecification) visit(context.pathSpecification()));
-    }
-
     // ***************** boolean expressions ******************
 
     @Override
@@ -1320,12 +1335,6 @@ class AstBuilder
     public Node visitCurrentUser(SqlBaseParser.CurrentUserContext context)
     {
         return new CurrentUser(getLocation(context.CURRENT_USER()));
-    }
-
-    @Override
-    public Node visitCurrentPath(SqlBaseParser.CurrentPathContext context)
-    {
-        return new CurrentPath(getLocation(context.CURRENT_PATH()));
     }
 
     @Override
@@ -1764,24 +1773,6 @@ class AstBuilder
         return new CallArgument(getLocation(context), context.identifier().getText(), (Expression) visit(context.expression()));
     }
 
-    @Override
-    public Node visitQualifiedArgument(SqlBaseParser.QualifiedArgumentContext context)
-    {
-        return new PathElement(getLocation(context), (Identifier) visit(context.identifier(0)), (Identifier) visit(context.identifier(1)));
-    }
-
-    @Override
-    public Node visitUnqualifiedArgument(SqlBaseParser.UnqualifiedArgumentContext context)
-    {
-        return new PathElement(getLocation(context), (Identifier) visit(context.identifier()));
-    }
-
-    @Override
-    public Node visitPathSpecification(SqlBaseParser.PathSpecificationContext context)
-    {
-        return new PathSpecification(getLocation(context), visit(context.pathElement(), PathElement.class));
-    }
-
     // ***************** helpers *****************
 
     @Override
@@ -2199,6 +2190,48 @@ class AstBuilder
         }
 
         throw new IllegalArgumentException("Unsupported type specification: " + type.getText());
+    }
+
+    private SqlParameterDeclaration getParameterDeclarations(SqlBaseParser.SqlParameterDeclarationContext context)
+    {
+        return new SqlParameterDeclaration((Identifier) visit(context.identifier()), getType(context.type()));
+    }
+
+    private RoutineCharacteristics getRoutineCharacteristics(SqlBaseParser.RoutineCharacteristicsContext context)
+    {
+        Language language = null;
+        Determinism determinism = null;
+        NullCallClause nullCallClause = null;
+
+        for (SqlBaseParser.RoutineCharacteristicContext characteristic : context.routineCharacteristic()) {
+            if (characteristic.language() != null) {
+                checkArgument(characteristic.language().SQL() != null, "Unsupported language: %s", characteristic.language().getText());
+                if (language != null) {
+                    throw new ParsingException(format("Duplicate language clause: %s", characteristic.language().getText()), getLocation(characteristic.language()));
+                }
+                language = Language.SQL;
+            }
+            else if (characteristic.determinism() != null) {
+                if (determinism != null) {
+                    throw new ParsingException(format("Duplicate determinism characteristics: %s", characteristic.determinism().getText()), getLocation(characteristic.determinism()));
+                }
+                determinism = characteristic.determinism().NOT() == null ? DETERMINISTIC : NOT_DETERMINISTIC;
+            }
+            else if (characteristic.nullCallClause() != null) {
+                if (nullCallClause != null) {
+                    throw new ParsingException(format("Duplicate null-call clause: %s", characteristic.nullCallClause().getText()), getLocation(characteristic.nullCallClause()));
+                }
+                nullCallClause = characteristic.nullCallClause().CALLED() != null ? CALLED_ON_NULL_INPUT : RETURNS_NULL_ON_NULL_INPUT;
+            }
+            else {
+                throw new IllegalArgumentException(format("Unsupported RoutineCharacteristic: %s", characteristic.getText()));
+            }
+        }
+
+        return new RoutineCharacteristics(
+                Optional.ofNullable(language),
+                Optional.ofNullable(determinism),
+                Optional.ofNullable(nullCallClause));
     }
 
     private String typeParameterToString(SqlBaseParser.TypeParameterContext typeParameter)

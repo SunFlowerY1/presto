@@ -15,6 +15,7 @@ package com.facebook.presto.operator;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.execution.Lifespan;
+import com.facebook.presto.execution.TaskId;
 import com.facebook.presto.metadata.FunctionManager;
 import com.facebook.presto.operator.TableFinishOperator.LifespanCommitter;
 import com.facebook.presto.operator.TableFinishOperator.TableFinishOperatorFactory;
@@ -23,11 +24,11 @@ import com.facebook.presto.operator.aggregation.InternalAggregationFunction;
 import com.facebook.presto.spi.block.Block;
 import com.facebook.presto.spi.block.LongArrayBlockBuilder;
 import com.facebook.presto.spi.connector.ConnectorOutputMetadata;
+import com.facebook.presto.spi.plan.AggregationNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.spi.statistics.ColumnStatisticMetadata;
 import com.facebook.presto.spi.statistics.ComputedStatistics;
 import com.facebook.presto.spi.type.Type;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
 import com.facebook.presto.sql.planner.plan.StatisticAggregationsDescriptor;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -266,7 +267,7 @@ public class TestTableFinishOperator
 
     private static byte[] getTableCommitContextBytes(Lifespan lifespan, int stageId, int taskId, boolean lifespanCommitRequired, boolean lastPage)
     {
-        return TABLE_COMMIT_CONTEXT_CODEC.toJsonBytes(new TableCommitContext(lifespan, stageId, taskId, lifespanCommitRequired, lastPage));
+        return TABLE_COMMIT_CONTEXT_CODEC.toJsonBytes(new TableCommitContext(lifespan, new TaskId("query", stageId, 0, taskId), lifespanCommitRequired, lastPage));
     }
 
     private static class TestingTableFinisher

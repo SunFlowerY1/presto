@@ -17,8 +17,9 @@ import com.facebook.presto.Session;
 import com.facebook.presto.cost.PlanCostEstimate;
 import com.facebook.presto.cost.PlanNodeStatsEstimate;
 import com.facebook.presto.cost.StatsAndCosts;
+import com.facebook.presto.execution.StageExecutionStats;
 import com.facebook.presto.execution.StageInfo;
-import com.facebook.presto.execution.StageStats;
+import com.facebook.presto.execution.TaskInfo;
 import com.facebook.presto.metadata.FunctionManager;
 import com.facebook.presto.metadata.OperatorNotFoundException;
 import com.facebook.presto.operator.StageExecutionDescriptor;
@@ -27,11 +28,14 @@ import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ConnectorTableLayoutHandle;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.function.FunctionHandle;
+import com.facebook.presto.spi.plan.AggregationNode;
+import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.FilterNode;
 import com.facebook.presto.spi.plan.LimitNode;
 import com.facebook.presto.spi.plan.OrderingScheme;
 import com.facebook.presto.spi.plan.PlanNode;
 import com.facebook.presto.spi.plan.PlanNodeId;
+import com.facebook.presto.spi.plan.ProjectNode;
 import com.facebook.presto.spi.plan.TableScanNode;
 import com.facebook.presto.spi.plan.TopNNode;
 import com.facebook.presto.spi.plan.ValuesNode;
@@ -51,10 +55,8 @@ import com.facebook.presto.sql.planner.SubPlan;
 import com.facebook.presto.sql.planner.TypeProvider;
 import com.facebook.presto.sql.planner.iterative.GroupReference;
 import com.facebook.presto.sql.planner.optimizations.JoinNodeUtils;
-import com.facebook.presto.sql.planner.plan.AggregationNode;
 import com.facebook.presto.sql.planner.plan.ApplyNode;
 import com.facebook.presto.sql.planner.plan.AssignUniqueId;
-import com.facebook.presto.sql.planner.plan.Assignments;
 import com.facebook.presto.sql.planner.plan.DeleteNode;
 import com.facebook.presto.sql.planner.plan.DistinctLimitNode;
 import com.facebook.presto.sql.planner.plan.EnforceSingleRowNode;
@@ -72,7 +74,6 @@ import com.facebook.presto.sql.planner.plan.MarkDistinctNode;
 import com.facebook.presto.sql.planner.plan.MetadataDeleteNode;
 import com.facebook.presto.sql.planner.plan.OutputNode;
 import com.facebook.presto.sql.planner.plan.PlanFragmentId;
-import com.facebook.presto.sql.planner.plan.ProjectNode;
 import com.facebook.presto.sql.planner.plan.RemoteSourceNode;
 import com.facebook.presto.sql.planner.plan.RowNumberNode;
 import com.facebook.presto.sql.planner.plan.SampleNode;
@@ -254,22 +255,23 @@ public class PlanPrinter
                 fragment.getPartitioning()));
 
         if (stageInfo.isPresent()) {
-            StageStats stageStats = stageInfo.get().getStageStats();
+            StageExecutionStats stageExecutionStats = stageInfo.get().getLatestAttemptExecutionInfo().getStats();
+            List<TaskInfo> tasks = stageInfo.get().getLatestAttemptExecutionInfo().getTasks();
 
-            double avgPositionsPerTask = stageInfo.get().getTasks().stream().mapToLong(task -> task.getStats().getProcessedInputPositions()).average().orElse(Double.NaN);
-            double squaredDifferences = stageInfo.get().getTasks().stream().mapToDouble(task -> Math.pow(task.getStats().getProcessedInputPositions() - avgPositionsPerTask, 2)).sum();
-            double sdAmongTasks = Math.sqrt(squaredDifferences / stageInfo.get().getTasks().size());
+            double avgPositionsPerTask = tasks.stream().mapToLong(task -> task.getStats().getProcessedInputPositions()).average().orElse(Double.NaN);
+            double squaredDifferences = tasks.stream().mapToDouble(task -> Math.pow(task.getStats().getProcessedInputPositions() - avgPositionsPerTask, 2)).sum();
+            double sdAmongTasks = Math.sqrt(squaredDifferences / tasks.size());
 
             builder.append(indentString(1))
                     .append(format("CPU: %s, Scheduled: %s, Input: %s (%s); per task: avg.: %s std.dev.: %s, Output: %s (%s)\n",
-                            stageStats.getTotalCpuTime().convertToMostSuccinctTimeUnit(),
-                            stageStats.getTotalScheduledTime().convertToMostSuccinctTimeUnit(),
-                            formatPositions(stageStats.getProcessedInputPositions()),
-                            stageStats.getProcessedInputDataSize(),
+                            stageExecutionStats.getTotalCpuTime().convertToMostSuccinctTimeUnit(),
+                            stageExecutionStats.getTotalScheduledTime().convertToMostSuccinctTimeUnit(),
+                            formatPositions(stageExecutionStats.getProcessedInputPositions()),
+                            stageExecutionStats.getProcessedInputDataSize(),
                             formatDouble(avgPositionsPerTask),
                             formatDouble(sdAmongTasks),
-                            formatPositions(stageStats.getOutputPositions()),
-                            stageStats.getOutputDataSize()));
+                            formatPositions(stageExecutionStats.getOutputPositions()),
+                            stageExecutionStats.getOutputDataSize()));
         }
 
         PartitioningScheme partitioningScheme = fragment.getPartitioningScheme();
@@ -653,7 +655,8 @@ public class PlanPrinter
             else {
                 nodeOutput = addNode(node, "TableScan", format("[%s]", table));
             }
-            printTableScanInfo(nodeOutput, node);
+            PlanNodeStats nodeStats = stats.map(s -> s.get(node.getId())).orElse(null);
+            printTableScanInfo(nodeOutput, node, nodeStats);
             return null;
         }
 
@@ -756,14 +759,8 @@ public class PlanPrinter
             }
 
             if (scanNode.isPresent()) {
-                printTableScanInfo(nodeOutput, scanNode.get());
                 PlanNodeStats nodeStats = stats.map(s -> s.get(node.getId())).orElse(null);
-                if (nodeStats != null) {
-                    // Add to 'details' rather than 'statistics', since these stats are node-specific
-                    nodeOutput.appendDetails("Input: %s (%s)", formatPositions(nodeStats.getPlanNodeInputPositions()), nodeStats.getPlanNodeInputDataSize().toString());
-                    double filtered = 100.0d * (nodeStats.getPlanNodeInputPositions() - nodeStats.getPlanNodeOutputPositions()) / nodeStats.getPlanNodeInputPositions();
-                    nodeOutput.appendDetailsLine(", Filtered: %s%%", formatDouble(filtered));
-                }
+                printTableScanInfo(nodeOutput, scanNode.get(), nodeStats);
                 return null;
             }
 
@@ -771,7 +768,7 @@ public class PlanPrinter
             return null;
         }
 
-        private void printTableScanInfo(NodeRepresentation nodeOutput, TableScanNode node)
+        private void printTableScanInfo(NodeRepresentation nodeOutput, TableScanNode node, PlanNodeStats nodeStats)
         {
             TableHandle table = node.getTable();
 
@@ -807,6 +804,21 @@ public class PlanPrinter
                                 nodeOutput.appendDetailsLine("%s", column);
                                 printConstraint(nodeOutput, column, predicate);
                             });
+                }
+            }
+
+            if (nodeStats != null) {
+                // Add to 'details' rather than 'statistics', since these stats are node-specific
+                long inputPositions = nodeStats.getPlanNodeInputPositions();
+                nodeOutput.appendDetails("Input: %s (%s)", formatPositions(inputPositions), nodeStats.getPlanNodeInputDataSize().toString());
+                double filtered = 100.0d * (inputPositions - nodeStats.getPlanNodeOutputPositions()) / inputPositions;
+                nodeOutput.appendDetailsLine(", Filtered: %s%%", formatDouble(filtered));
+
+                long rawInputPositions = nodeStats.getPlanNodeRawInputPositions();
+                if (rawInputPositions != inputPositions) {
+                    nodeOutput.appendDetails("Raw input: %s (%s)", formatPositions(rawInputPositions), nodeStats.getPlanNodeRawInputDataSize().toString());
+                    double rawFiltered = 100.0d * (rawInputPositions - inputPositions) / rawInputPositions;
+                    nodeOutput.appendDetailsLine(", Filtered: %s%%", formatDouble(rawFiltered));
                 }
             }
         }

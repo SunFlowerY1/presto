@@ -260,7 +260,6 @@ public class QueryMonitor
                 session.getUserAgent(),
                 session.getClientInfo(),
                 session.getClientTags(),
-                session.getClientCapabilities(),
                 session.getSource(),
                 session.getCatalog(),
                 session.getSchema(),
@@ -369,7 +368,7 @@ public class QueryMonitor
                 return task;
             }
         }
-        return stageInfo.getTasks().stream()
+        return stageInfo.getLatestAttemptExecutionInfo().getTasks().stream()
                 .filter(taskInfo -> taskInfo.getTaskStatus().getState() == TaskState.FAILED)
                 .findFirst();
     }
@@ -419,7 +418,7 @@ public class QueryMonitor
                     continue;
                 }
 
-                for (TaskInfo taskInfo : stage.getTasks()) {
+                for (TaskInfo taskInfo : stage.getLatestAttemptExecutionInfo().getTasks()) {
                     TaskStats taskStats = taskInfo.getStats();
 
                     DateTime firstStartTime = taskStats.getFirstStartTime();
@@ -531,7 +530,7 @@ public class QueryMonitor
     {
         Distribution cpuDistribution = new Distribution();
 
-        for (TaskInfo taskInfo : stageInfo.getTasks()) {
+        for (TaskInfo taskInfo : stageInfo.getLatestAttemptExecutionInfo().getTasks()) {
             cpuDistribution.add(taskInfo.getStats().getTotalCpuTime().toMillis());
         }
 
@@ -539,7 +538,7 @@ public class QueryMonitor
 
         return new StageCpuDistribution(
                 stageInfo.getStageId().getId(),
-                stageInfo.getTasks().size(),
+                stageInfo.getLatestAttemptExecutionInfo().getTasks().size(),
                 snapshot.getP25(),
                 snapshot.getP50(),
                 snapshot.getP75(),

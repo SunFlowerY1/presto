@@ -85,8 +85,10 @@ public class LongDictionarySelectiveStreamReader
             LocalMemoryContext systemMemoryContext)
     {
         super(outputType);
+        requireNonNull(filter, "filter is null");
+        checkArgument(filter.isPresent() || outputRequired, "filter must be present if output is not required");
         this.streamDescriptor = requireNonNull(streamDescriptor, "streamDescriptor is null");
-        this.filter = requireNonNull(filter, "filter is null").orElse(null);
+        this.filter = filter.orElse(null);
         this.systemMemoryContext = requireNonNull(systemMemoryContext, "systemMemoryContext is null");
 
         nonDeterministicFilter = this.filter != null && !this.filter.isDeterministic();
@@ -149,7 +151,7 @@ public class LongDictionarySelectiveStreamReader
                 if (filter == null || filter.testLong(value)) {
                     if (outputRequired) {
                         values[outputPositionCount] = value;
-                        if (nulls != null) {
+                        if (presentStream != null && nullsAllowed) {
                             nulls[outputPositionCount] = false;
                         }
                     }
@@ -192,7 +194,9 @@ public class LongDictionarySelectiveStreamReader
             if (inDictionaryStream != null) {
                 inDictionaryStream.skip(dataToSkip);
             }
-            dataStream.skip(dataToSkip);
+            if (dataStream != null) {
+                dataStream.skip(dataToSkip);
+            }
         }
         else {
             if (inDictionaryStream != null) {
